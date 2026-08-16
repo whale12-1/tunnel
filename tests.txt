@@ -1,0 +1,10 @@
+# Запускаем 3 параллельных фоновых потока
+$job1 = Start-Job { "A" * 1000000 | curl.exe --socks5-hostname 127.0.0.1:1080 -X POST --data-binary "@-" https://postman-echo.com/post }
+$job2 = Start-Job { "B" * 1000000 | curl.exe --socks5-hostname 127.0.0.1:1080 -X POST --data-binary "@-" https://postman-echo.com/post }
+$job3 = Start-Job { curl.exe --socks5-hostname 127.0.0.1:1080 https://httpbin.org/bytes/500000 -o test.bin }
+
+# Ждем завершения всех задач
+Get-Job | Wait-Job | Receive-Job
+
+
+ Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$PWD'; .\vpn_cli_client.exe"

@@ -1,0 +1,12 @@
+# —борка и объектные файлы
+build/
+out/
+bin/
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.suo
+CMakeCache.txt
+CMakeFiles/
