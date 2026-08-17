@@ -50,76 +50,71 @@ namespace Vpn::Client {
 
             m_vpnSocket.set_option(boost::asio::ip::tcp::no_delay(true));
             auto myPubKey = m_cryptoEngine.GetLocalPublicKey();
+
+            // Генерируем единый пакет ClientHello
             auto tlsPacket = Protocol::TlsHelper::BuildClientHello("dl.google.com", myPubKey, m_serverPublicKey);
 
-            if (tlsPacket.size() <= 10) {
+            if (tlsPacket.empty()) {
                 if (onConnected) onConnected(false);
                 return;
             }
 
-            static thread_local std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(1, tlsPacket.size() - 10);
-            size_t splitOffset = dist(rng); // Случайное разрезание ClientHello
+            // Оборачиваем весь пакет в shared_ptr для удержания памяти во время асинхронной записи
+            auto fullTlsPacket = std::make_shared<std::vector<uint8_t>>(std::move(tlsPacket));
 
-            auto chunk1 = std::make_shared<std::vector<uint8_t>>(tlsPacket.begin(), tlsPacket.begin() + splitOffset);
-            auto chunk2 = std::make_shared<std::vector<uint8_t>>(tlsPacket.begin() + splitOffset, tlsPacket.end());
+            // Отправляем пакет ЦЕЛИКОМ за один вызов async_write
+            boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*fullTlsPacket),
+                [this, self, onConnected, fullTlsPacket](boost::system::error_code writeEc, size_t) {
+                    if (writeEc) { if (onConnected) onConnected(false); return; }
 
-            boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*chunk1),
-                [this, self, onConnected, chunk1, chunk2](boost::system::error_code writeEc1, size_t) {
-                    if (writeEc1) { if (onConnected) onConnected(false); return; }
+                    // Как только ClientHello отправлен, сразу ждем ответ (ServerHello) от сервера
+                    auto headerBuf = std::make_shared<std::vector<uint8_t>>(5);
 
-                    boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*chunk2),
-                        [this, self, onConnected, chunk2](boost::system::error_code writeEc2, size_t) {
-                            if (writeEc2) { if (onConnected) onConnected(false); return; }
+                    boost::asio::async_read(m_vpnSocket, boost::asio::buffer(*headerBuf),
+                        [this, self, onConnected, headerBuf](boost::system::error_code readEc, size_t) {
+                            if (readEc) { if (onConnected) onConnected(false); return; }
 
-                            auto headerBuf = std::make_shared<std::vector<uint8_t>>(5);
-                            boost::asio::async_read(m_vpnSocket, boost::asio::buffer(*headerBuf),
-                                [this, self, onConnected, headerBuf](boost::system::error_code readEc, size_t) {
-                                    if (readEc) { if (onConnected) onConnected(false); return; }
+                            uint16_t bodyLen = ((*headerBuf)[3] << 8) | (*headerBuf)[4];
+                            auto fullServerHello = std::make_shared<std::vector<uint8_t>>(5 + bodyLen);
+                            std::memcpy(fullServerHello->data(), headerBuf->data(), 5);
 
-                                    uint16_t bodyLen = ((*headerBuf)[3] << 8) | (*headerBuf)[4];
-                                    auto fullServerHello = std::make_shared<std::vector<uint8_t>>(5 + bodyLen);
-                                    std::memcpy(fullServerHello->data(), headerBuf->data(), 5);
+                            boost::asio::async_read(m_vpnSocket, boost::asio::buffer(fullServerHello->data() + 5, bodyLen),
+                                [this, self, onConnected, fullServerHello](boost::system::error_code readBodyEc, size_t) {
+                                    if (readBodyEc) { if (onConnected) onConnected(false); return; }
 
-                                    boost::asio::async_read(m_vpnSocket, boost::asio::buffer(fullServerHello->data() + 5, bodyLen),
-                                        [this, self, onConnected, fullServerHello](boost::system::error_code readBodyEc, size_t) {
-                                            if (readBodyEc) { if (onConnected) onConnected(false); return; }
+                                    std::vector<uint8_t> serverPubKey;
+                                    if (!Protocol::TlsHelper::ParseServerHello(*fullServerHello, serverPubKey)) {
+                                        if (onConnected) onConnected(false);
+                                        return;
+                                    }
 
-                                            std::vector<uint8_t> serverPubKey;
-                                            if (!Protocol::TlsHelper::ParseServerHello(*fullServerHello, serverPubKey)) {
-                                                if (onConnected) onConnected(false);
-                                                return;
-                                            }
+                                    m_sessionKey = m_cryptoEngine.DeriveSharedSecret(serverPubKey);
+                                    if (m_sessionKey.empty()) {
+                                        if (onConnected) onConnected(false);
+                                        return;
+                                    }
 
-                                            m_sessionKey = m_cryptoEngine.DeriveSharedSecret(serverPubKey);
-                                            if (m_sessionKey.empty()) {
-                                                if (onConnected) onConnected(false);
-                                                return;
-                                            }
+                                    auto ccsBuf = std::make_shared<std::vector<uint8_t>>(
+                                        std::initializer_list<uint8_t>{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
+                                    );
 
-                                            auto ccsBuf = std::make_shared<std::vector<uint8_t>>(
-                                                std::initializer_list<uint8_t>{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
-                                            );
+                                    boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*ccsBuf),
+                                        [this, self, onConnected, ccsBuf](boost::system::error_code ccsEc, size_t) {
+                                            if (ccsEc) { if (onConnected) onConnected(false); return; }
 
-                                            boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*ccsBuf),
-                                                [this, self, onConnected, ccsBuf](boost::system::error_code ccsEc, size_t) {
-                                                    if (ccsEc) { if (onConnected) onConnected(false); return; }
+                                            m_isConnected = true;
+                                            m_isReconnecting = false;
+                                            m_reconnectAttempt = 0;
 
-                                                    m_isConnected = true;
-                                                    m_isReconnecting = false;
-                                                    m_reconnectAttempt = 0;
+                                            std::cout << "[Transport] Main Mux TLS Tunnel established successfully!\n";
 
-                                                    std::cout << "[Transport] Main Mux TLS Tunnel established successfully!\n";
+                                            SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {});
 
-                                                    SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {});
+                                            DoReadFrameHeader();
+                                            StartPingTimer();
 
-                                                    DoReadFrameHeader();
-                                                    StartPingTimer();
-
-                                                    if (onConnected) onConnected(true);
-                                                });
+                                            if (onConnected) onConnected(true);
                                         });
-
                                 });
                         });
                 });
@@ -215,11 +210,18 @@ namespace Vpn::Client {
         if (!m_isConnected) return;
 
         size_t offset = 0;
-        const size_t MAX_CHUNK_SIZE = 15000;
 
-        // Фрагментация на куски по 15000 байт 
+        // Статический генератор случайных чисел для потока
+        static thread_local std::mt19937 rng(std::random_device{}());
+        // Диапазон размеров куска (например, от 8000 до 14000 байт)
+        std::uniform_int_distribution<size_t> chunkDist(8000, 14000);
+
+        // Фрагментация на куски случайного размера
         do {
-            size_t chunkSize = payload.empty() ? 0 : std::min(payload.size() - offset, MAX_CHUNK_SIZE);
+            // Генерируем случайный лимит для текущего фрагмента
+            size_t currentChunkLimit = chunkDist(rng);
+
+            size_t chunkSize = payload.empty() ? 0 : std::min(payload.size() - offset, currentChunkLimit);
             std::vector<uint8_t> chunk;
             if (chunkSize > 0) {
                 chunk.assign(payload.begin() + offset, payload.begin() + offset + chunkSize);
@@ -227,9 +229,8 @@ namespace Vpn::Client {
 
             auto plainMux = Protocol::StreamFrameHelper::PackMuxFrame(streamId, cmd, chunk);
 
-            static thread_local std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(16, 128);
-            auto padded = Protocol::PaddingHelper::AddPadding(plainMux, dist(rng));
+            std::uniform_int_distribution<size_t> padDist(16, 128);
+            auto padded = Protocol::PaddingHelper::AddPadding(plainMux, padDist(rng));
             auto iv = CryptoEngine::GenerateRandomBytes(Protocol::IV_SIZE);
 
             std::vector<uint8_t> cipherText, authTag;

@@ -100,7 +100,20 @@ namespace Vpn::Server {
                             return;
                         }
                         m_state = State::Tunneling;
-                        std::cout << "[Server] Mux Tunnel Active! Waiting for streams...\n";
+                        std::cout << "[Server] Mux Tunnel Active! Sending Fake Certificate Payload...\n";
+
+                        // --- ИМИТАЦИЯ TLS 1.3 СЕРТИФИКАТА GOOGLE ДЛЯ ОБХОДА DPI ---
+                        // Генерируем мусорный пакет случайного размера (от 2500 до 3800 байт),
+                        // который по размеру точно совпадает со стандартной цепочкой сертификатов Google.
+                        static thread_local std::mt19937 rng(std::random_device{}());
+                        std::uniform_int_distribution<size_t> dist(2500, 3800);
+                        std::vector<uint8_t> dummyCertPayload(dist(rng), 0x00); // Заполняем нулями
+
+                        // Отправляем как системный Ping. 
+                        // Mux-протокол его зашифрует, добавит паддинг и обернет в TLS Record 0x17.
+                        SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, dummyCertPayload);
+                        // ----------------------------------------------------------
+
                         DoReadFrameHeader();
                     }
                 );
@@ -360,11 +373,16 @@ namespace Vpn::Server {
 
     void Session::SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload) {
         size_t offset = 0;
-        const size_t MAX_CHUNK_SIZE = 15000;
+
+        static thread_local std::mt19937 rng(std::random_device{}());
+        // Можно варьировать диапазон в зависимости от нужд обфускации
+        std::uniform_int_distribution<size_t> chunkDist(6000, 14500);
 
         // Фрагментация данных
         do {
-            size_t chunkSize = payload.empty() ? 0 : std::min(payload.size() - offset, MAX_CHUNK_SIZE);
+            size_t currentChunkLimit = chunkDist(rng);
+            size_t chunkSize = payload.empty() ? 0 : std::min(payload.size() - offset, currentChunkLimit);
+
             std::vector<uint8_t> chunk;
             if (chunkSize > 0) {
                 chunk.assign(payload.begin() + offset, payload.begin() + offset + chunkSize);
@@ -372,9 +390,8 @@ namespace Vpn::Server {
 
             auto plainMux = Protocol::StreamFrameHelper::PackMuxFrame(streamId, cmd, chunk);
 
-            static thread_local std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(16, 128);
-            auto padded = Protocol::PaddingHelper::AddPadding(plainMux, dist(rng));
+            std::uniform_int_distribution<size_t> padDist(16, 128);
+            auto padded = Protocol::PaddingHelper::AddPadding(plainMux, padDist(rng));
             auto iv = CryptoEngine::GenerateRandomBytes(Protocol::IV_SIZE);
 
             std::vector<uint8_t> cipherText, authTag;
