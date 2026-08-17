@@ -47,7 +47,7 @@ namespace Vpn::Client {
         void DoWriteQueue();
 
         void StartPingTimer();
-
+        void DoReadHandshakeCertPayload(std::function<void(bool success)> onConnected);
         boost::asio::io_context& m_ioContext;
         tcp::socket m_vpnSocket;
         std::string m_serverIp;

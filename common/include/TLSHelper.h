@@ -82,6 +82,7 @@ namespace Vpn::Protocol {
             const std::vector<uint8_t>& packet,
             std::vector<uint8_t>& outServerPubKey
         );
+        static std::vector<uint8_t> BuildFakeTls13HandshakePayload(size_t targetTotalSize = 2800);
 
     private:
         static std::vector<uint8_t> ComputeHmacSha256(

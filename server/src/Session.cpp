@@ -84,10 +84,6 @@ namespace Vpn::Server {
 
                 std::vector<uint8_t> clientSessionId(fullTlsPacket->begin() + 44, fullTlsPacket->begin() + 76);
                 auto serverHelloPacket = Protocol::TlsHelper::BuildServerHello(localPubKey, clientSessionId);
-
-                std::vector<uint8_t> ccs = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
-                serverHelloPacket.insert(serverHelloPacket.end(), ccs.begin(), ccs.end());
-
                 auto serverHelloBufPtr = std::make_shared<std::vector<uint8_t>>(std::move(serverHelloPacket));
 
                 boost::asio::async_write(
@@ -99,22 +95,28 @@ namespace Vpn::Server {
                             CloseAll();
                             return;
                         }
-                        m_state = State::Tunneling;
-                        std::cout << "[Server] Mux Tunnel Active! Sending Fake Certificate Payload...\n";
 
-                        // --- ИМИТАЦИЯ TLS 1.3 СЕРТИФИКАТА GOOGLE ДЛЯ ОБХОДА DPI ---
-                        // Генерируем мусорный пакет случайного размера (от 2500 до 3800 байт),
-                        // который по размеру точно совпадает со стандартной цепочкой сертификатов Google.
+                        // 2. Сразу за ServerHello отправляем 0x17 Application Data (Encrypted Extensions / Certs)
                         static thread_local std::mt19937 rng(std::random_device{}());
-                        std::uniform_int_distribution<size_t> dist(2500, 3800);
-                        std::vector<uint8_t> dummyCertPayload(dist(rng), 0x00); // Заполняем нулями
+                        std::uniform_int_distribution<size_t> dist(2600, 3400); // Имитируем реальный размер цепочки Google
 
-                        // Отправляем как системный Ping. 
-                        // Mux-протокол его зашифрует, добавит паддинг и обернет в TLS Record 0x17.
-                        SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, dummyCertPayload);
-                        // ----------------------------------------------------------
+                        auto fakeCertRecord = Protocol::TlsHelper::BuildFakeTls13HandshakePayload(dist(rng));
+                        auto fakeCertBufPtr = std::make_shared<std::vector<uint8_t>>(std::move(fakeCertRecord));
 
-                        DoReadFrameHeader();
+                        boost::asio::async_write(
+                            m_clientSocket,
+                            boost::asio::buffer(*fakeCertBufPtr),
+                            [this, self, fakeCertBufPtr](boost::system::error_code certWriteEc, size_t) {
+                                if (certWriteEc) {
+                                    CloseAll();
+                                    return;
+                                }
+
+                                m_state = State::Tunneling;
+                                std::cout << "[Server] REALITY TLS 1.3 Handshake completed successfully! Mux Active.\n";
+                                DoReadFrameHeader();
+                            }
+                        );
                     }
                 );
             }

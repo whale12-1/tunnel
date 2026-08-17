@@ -346,19 +346,15 @@ namespace Vpn::Protocol {
     {
         std::vector<uint8_t> body;
 
-        // 1. Версия TLS 1.2 (0x0303) - обязательно для совместимости
+        // 1. Version: TLS 1.2 (0x0303) - обязательно для TLS 1.3 Handshake Record
         body.push_back(0x03); body.push_back(0x03);
 
         // 2. Server Random (32 байта)
         std::vector<uint8_t> serverRandom(32);
         RAND_bytes(serverRandom.data(), 32);
-
-        // По стандарту TLS 1.3, если сервер отвечает на downgrade (до TLS 1.2), 
-        // он должен вставить специальный маркер в последние 8 байт Random.
-        // Но так как мы согласовали TLS 1.3, оставляем просто случайные байты.
         body.insert(body.end(), serverRandom.begin(), serverRandom.end());
 
-        // 3. Эхо Client Session ID (длина + сами байты)
+        // 3. Echo Client Session ID
         body.push_back(static_cast<uint8_t>(clientSessionId.size()));
         body.insert(body.end(), clientSessionId.begin(), clientSessionId.end());
 
@@ -368,46 +364,63 @@ namespace Vpn::Protocol {
         // 5. Compression: null (0x00)
         body.push_back(0x00);
 
-        // 6. Расширения (Extensions) сервера
+        // 6. Extensions
         std::vector<uint8_t> extBuf;
 
-        // Ext: supported_versions (0x002b) -> подтверждаем TLS 1.3 (0x0304)
-        extBuf.push_back(0x00); extBuf.push_back(0x2b); // Type
-        extBuf.push_back(0x00); extBuf.push_back(0x02); // Length
-        extBuf.push_back(0x03); extBuf.push_back(0x04); // Value
+        // Ext: supported_versions (0x002b) -> Подтверждаем TLS 1.3 (0x0304)
+        WriteU16(extBuf, 0x002b);
+        WriteU16(extBuf, 0x0002);
+        WriteU16(extBuf, 0x0304);
 
-        // Ext: key_share (0x0033) -> наш серверный X25519 публичный ключ
-        extBuf.push_back(0x00); extBuf.push_back(0x33); // Type
-        extBuf.push_back(0x00); extBuf.push_back(36);   // Length
-        extBuf.push_back(0x00); extBuf.push_back(0x1d); // Group: x25519
-        extBuf.push_back(0x00); extBuf.push_back(32);   // Key length
+        // Ext: key_share (0x0033) -> X25519 серверный ключ (36 байт)
+        WriteU16(extBuf, 0x0033);
+        WriteU16(extBuf, 36);
+        WriteU16(extBuf, 0x001d); // x25519
+        WriteU16(extBuf, 32);
         extBuf.insert(extBuf.end(), serverPubKey.begin(), serverPubKey.end());
 
-        // Записываем длину всех расширений
-        body.push_back(static_cast<uint8_t>(extBuf.size() >> 8));
-        body.push_back(static_cast<uint8_t>(extBuf.size() & 0xFF));
+        // Записываем длину расширений
+        WriteU16(body, static_cast<uint16_t>(extBuf.size()));
         body.insert(body.end(), extBuf.begin(), extBuf.end());
 
-        // --- ФОРМИРОВАНИЕ ИТОГОВОГО ПАКЕТА ---
+        // --- СБОРКА ПАКЕТА ---
         std::vector<uint8_t> packet;
 
-        // [Record 1: ServerHello]
-        packet.push_back(0x16); // Handshake
-        packet.push_back(0x03); packet.push_back(0x03); // TLS 1.2
+        // [Record 1: ServerHello (0x16)]
+        packet.push_back(0x16); // Record Type: Handshake
+        WriteU16(packet, 0x0303); // TLS 1.2
         uint16_t hsLen = static_cast<uint16_t>(body.size() + 4);
-        packet.push_back(hsLen >> 8); packet.push_back(hsLen & 0xFF);
+        WriteU16(packet, hsLen);
 
         packet.push_back(0x02); // Message Type: ServerHello
-        packet.push_back(0x00); // Length (3 байта)
-        packet.push_back(static_cast<uint8_t>(body.size() >> 8));
-        packet.push_back(static_cast<uint8_t>(body.size() & 0xFF));
+        packet.push_back(0x00); // 24-bit length
+        WriteU16(packet, static_cast<uint16_t>(body.size()));
         packet.insert(packet.end(), body.begin(), body.end());
 
-        // [Record 2: ChangeCipherSpec] - КРИТИЧЕСКИ ВАЖНО ДЛЯ DPI
-        packet.push_back(0x14); // Тип: ChangeCipherSpec
-        packet.push_back(0x03); packet.push_back(0x03); // Версия
-        packet.push_back(0x00); packet.push_back(0x01); // Длина: 1 байт
-        packet.push_back(0x01); // Значение (всегда 0x01)
+        // [Record 2: ChangeCipherSpec (0x14)]
+        packet.push_back(0x14); // Record Type: ChangeCipherSpec
+        WriteU16(packet, 0x0303);
+        WriteU16(packet, 0x0001);
+        packet.push_back(0x01); // Payload
+
+        return packet;
+    }
+
+    // Генерация псевдо-зашифрованной записи Application Data (0x17),
+    // маскирующей цепочку EncryptedExtensions + Certificate + CertVerify + Finished
+    std::vector<uint8_t> TlsHelper::BuildFakeTls13HandshakePayload(size_t targetTotalSize) {
+        std::vector<uint8_t> packet;
+        packet.push_back(0x17); // Record Type: Application Data
+        WriteU16(packet, 0x0303); // TLS 1.2 (стандарт для TLS 1.3 Record Layer)
+
+        // Разбор размера нагрузки за вычетом 5 байт заголовка TLS Record
+        size_t payloadLen = (targetTotalSize > 5) ? targetTotalSize - 5 : 2800;
+        WriteU16(packet, static_cast<uint16_t>(payloadLen));
+
+        // Заполняем высокоестественной случайной энтропией (выглядит как AES-GCM / ChaCha20)
+        std::vector<uint8_t> randomEncryptedData(payloadLen);
+        RAND_bytes(randomEncryptedData.data(), static_cast<int>(payloadLen));
+        packet.insert(packet.end(), randomEncryptedData.begin(), randomEncryptedData.end());
 
         return packet;
     }

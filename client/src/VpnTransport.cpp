@@ -51,23 +51,18 @@ namespace Vpn::Client {
             m_vpnSocket.set_option(boost::asio::ip::tcp::no_delay(true));
             auto myPubKey = m_cryptoEngine.GetLocalPublicKey();
 
-            // Генерируем единый пакет ClientHello
             auto tlsPacket = Protocol::TlsHelper::BuildClientHello("dl.google.com", myPubKey, m_serverPublicKey);
-
             if (tlsPacket.empty()) {
                 if (onConnected) onConnected(false);
                 return;
             }
 
-            // Оборачиваем весь пакет в shared_ptr для удержания памяти во время асинхронной записи
             auto fullTlsPacket = std::make_shared<std::vector<uint8_t>>(std::move(tlsPacket));
 
-            // Отправляем пакет ЦЕЛИКОМ за один вызов async_write
             boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*fullTlsPacket),
                 [this, self, onConnected, fullTlsPacket](boost::system::error_code writeEc, size_t) {
                     if (writeEc) { if (onConnected) onConnected(false); return; }
 
-                    // Как только ClientHello отправлен, сразу ждем ответ (ServerHello) от сервера
                     auto headerBuf = std::make_shared<std::vector<uint8_t>>(5);
 
                     boost::asio::async_read(m_vpnSocket, boost::asio::buffer(*headerBuf),
@@ -102,22 +97,54 @@ namespace Vpn::Client {
                                         [this, self, onConnected, ccsBuf](boost::system::error_code ccsEc, size_t) {
                                             if (ccsEc) { if (onConnected) onConnected(false); return; }
 
-                                            m_isConnected = true;
-                                            m_isReconnecting = false;
-                                            m_reconnectAttempt = 0;
-
-                                            std::cout << "[Transport] Main Mux TLS Tunnel established successfully!\n";
-
-                                            SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {});
-
-                                            DoReadFrameHeader();
-                                            StartPingTimer();
-
-                                            if (onConnected) onConnected(true);
+                                            // Вычитываем зашифрованную цепочку сертификатов (0x17) от сервера
+                                            DoReadHandshakeCertPayload(onConnected);
                                         });
                                 });
                         });
                 });
+            });
+    }
+
+    void VpnTransport::DoReadHandshakeCertPayload(std::function<void(bool success)> onConnected) {
+        auto self = shared_from_this();
+        auto headerBuf = std::make_shared<std::array<uint8_t, 5>>();
+
+        boost::asio::async_read(m_vpnSocket, boost::asio::buffer(headerBuf->data(), 5),
+            [this, self, onConnected, headerBuf](boost::system::error_code ec, size_t) {
+                if (ec) { if (onConnected) onConnected(false); return; }
+
+                uint8_t contentType = (*headerBuf)[0];
+                uint16_t payloadLen = (static_cast<uint16_t>((*headerBuf)[3]) << 8) | (*headerBuf)[4];
+
+                if (contentType != 0x17 && contentType != 0x14) {
+                    if (onConnected) onConnected(false);
+                    return;
+                }
+
+                auto certPayloadBuf = std::make_shared<std::vector<uint8_t>>(payloadLen);
+                boost::asio::async_read(m_vpnSocket, boost::asio::buffer(*certPayloadBuf),
+                    [this, self, onConnected, certPayloadBuf, contentType](boost::system::error_code readEc, size_t) {
+                        if (readEc) { if (onConnected) onConnected(false); return; }
+
+                        if (contentType == 0x14) {
+                            DoReadHandshakeCertPayload(onConnected);
+                            return;
+                        }
+
+                        // Рукопожатие REALITY завершено, переходим к мультиплексированию
+                        m_isConnected = true;
+                        m_isReconnecting = false;
+                        m_reconnectAttempt = 0;
+
+                        std::cout << "[Transport] REALITY TLS 1.3 Tunnel established successfully! Mux Active.\n";
+
+                        SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {});
+                        DoReadFrameHeader();
+                        StartPingTimer();
+
+                        if (onConnected) onConnected(true);
+                    });
             });
     }
 
