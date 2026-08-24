@@ -1,26 +1,32 @@
-#include "Protocol.h"
+п»ї#include "Protocol.h"
+#include <cstring>
+
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <cstring>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#endif
 
 namespace Vpn::Protocol {
 
     // -------------------------------------------------------------------
-    // 1. MUX Сериализация и Десериализация
+    // 1. MUX РЎРµСЂРёР°Р»РёР·Р°С†РёСЏ Рё Р”РµСЃРµСЂРёР°Р»РёР·Р°С†РёСЏ
     // -------------------------------------------------------------------
     std::vector<uint8_t> StreamFrameHelper::PackMuxFrame(uint32_t streamId, Command cmd, const std::vector<uint8_t>& payload) {
         std::vector<uint8_t> buffer;
         buffer.reserve(5 + payload.size());
 
-        // Запись StreamID в сетевом формате Big-Endian (4 байта)
+        // Р—Р°РїРёСЃСЊ StreamID РІ СЃРµС‚РµРІРѕРј С„РѕСЂРјР°С‚Рµ Big-Endian (4 Р±Р°Р№С‚Р°)
         uint32_t netStreamId = htonl(streamId);
         const uint8_t* streamBytes = reinterpret_cast<const uint8_t*>(&netStreamId);
         buffer.insert(buffer.end(), streamBytes, streamBytes + 4);
 
-        // Запись Команды (1 байт)
+        // Р—Р°РїРёСЃСЊ РљРѕРјР°РЅРґС‹ (1 Р±Р°Р№С‚)
         buffer.push_back(static_cast<uint8_t>(cmd));
 
-        // Полезная нагрузка
+        // РџРѕР»РµР·РЅР°СЏ РЅР°РіСЂСѓР·РєР°
         if (!payload.empty()) {
             buffer.insert(buffer.end(), payload.begin(), payload.end());
         }
@@ -29,18 +35,18 @@ namespace Vpn::Protocol {
     }
 
     bool StreamFrameHelper::UnpackMuxFrame(const std::vector<uint8_t>& plainText, MuxFrame& outFrame) {
-        // Минимальный размер Mux-кадра: StreamID(4B) + Command(1B) = 5B
+        // РњРёРЅРёРјР°Р»СЊРЅС‹Р№ СЂР°Р·РјРµСЂ Mux-РєР°РґСЂР°: StreamID(4B) + Command(1B) = 5B
         if (plainText.size() < 5) return false;
 
-        // Чтение StreamID
+        // Р§С‚РµРЅРёРµ StreamID
         uint32_t netStreamId = 0;
         std::memcpy(&netStreamId, plainText.data(), 4);
         outFrame.streamId = ntohl(netStreamId);
 
-        // Чтение Command
+        // Р§С‚РµРЅРёРµ Command
         outFrame.command = static_cast<Command>(plainText[4]);
 
-        // Извлечение Payload (если есть)
+        // РР·РІР»РµС‡РµРЅРёРµ Payload (РµСЃР»Рё РµСЃС‚СЊ)
         if (plainText.size() > 5) {
             outFrame.payload.assign(plainText.begin() + 5, plainText.end());
         }
@@ -52,12 +58,13 @@ namespace Vpn::Protocol {
     }
 
     // -------------------------------------------------------------------
-    // 2. Сериализация и Парсинг адресов назначения (TargetAddress)
-    // -------------------------------------------------------------------
+        // 2. РЎРµСЂРёР°Р»РёР·Р°С†РёСЏ Рё РџР°СЂСЃРёРЅРі Р°РґСЂРµСЃРѕРІ РЅР°Р·РЅР°С‡РµРЅРёСЏ (TargetAddress)
+        // -------------------------------------------------------------------
     std::vector<uint8_t> StreamFrameHelper::SerializeTargetAddress(const TargetAddress& target) {
         std::vector<uint8_t> buffer;
 
         buffer.push_back(static_cast<uint8_t>(target.type));
+        buffer.push_back(target.isUdp ? 0x01 : 0x00); // Р—Р°РїРёСЃС‹РІР°РµРј С„Р»Р°Рі UDP (1 Р±Р°Р№С‚)
 
         if (target.type == AddressType::IPv4) {
             in_addr addr{};
@@ -85,7 +92,7 @@ namespace Vpn::Protocol {
             }
         }
 
-        // Запись порта в Big-Endian (2 байта)
+        // Р—Р°РїРёСЃСЊ РїРѕСЂС‚Р° РІ Big-Endian (2 Р±Р°Р№С‚Р°)
         uint16_t netPort = htons(target.port);
         const uint8_t* portBytes = reinterpret_cast<const uint8_t*>(&netPort);
         buffer.insert(buffer.end(), portBytes, portBytes + 2);
@@ -94,13 +101,13 @@ namespace Vpn::Protocol {
     }
 
     bool StreamFrameHelper::DeserializeTargetAddress(const uint8_t* buffer, size_t size, TargetAddress& outTarget) {
-        if (!buffer || size < 3) return false; // Минимально: AddrType(1B) + Port(2B)
+        if (!buffer || size < 4) return false; // РњРёРЅРёРјР°Р»СЊРЅРѕ: AddrType(1B) + isUdp(1B) + Port(2B) = 4B
 
         size_t offset = 0;
-        AddressType addrType = static_cast<AddressType>(buffer[offset++]);
-        outTarget.type = addrType;
+        outTarget.type = static_cast<AddressType>(buffer[offset++]);
+        outTarget.isUdp = (buffer[offset++] != 0); // Р§РёС‚Р°РµРј С„Р»Р°Рі UDP
 
-        if (addrType == AddressType::IPv4) {
+        if (outTarget.type == AddressType::IPv4) {
             if (size < offset + 4 + 2) return false;
 
             char ipStr[INET_ADDRSTRLEN];
@@ -115,7 +122,7 @@ namespace Vpn::Protocol {
                 return false;
             }
         }
-        else if (addrType == AddressType::Domain) {
+        else if (outTarget.type == AddressType::Domain) { // РСЃРїСЂР°РІР»РµРЅРѕ РЅР° outTarget.type
             if (size < offset + 1) return false;
 
             uint8_t domainLen = buffer[offset++];
@@ -124,7 +131,7 @@ namespace Vpn::Protocol {
             outTarget.address = std::string(reinterpret_cast<const char*>(buffer + offset), domainLen);
             offset += domainLen;
         }
-        else if (addrType == AddressType::IPv6) {
+        else if (outTarget.type == AddressType::IPv6) {
             if (size < offset + 16 + 2) return false;
 
             char ipStr[INET6_ADDRSTRLEN];
@@ -149,9 +156,8 @@ namespace Vpn::Protocol {
 
         return true;
     }
-
     // -------------------------------------------------------------------
-    // 3. Формирование и парсинг TCP-кадра сети (2-байтовый заголовок длины)
+    // 3. Р¤РѕСЂРјРёСЂРѕРІР°РЅРёРµ Рё РїР°СЂСЃРёРЅРі TCP-РєР°РґСЂР° СЃРµС‚Рё (2-Р±Р°Р№С‚РѕРІС‹Р№ Р·Р°РіРѕР»РѕРІРѕРє РґР»РёРЅС‹)
     // -------------------------------------------------------------------
     std::vector<uint8_t> StreamFrameHelper::PackTcpFrame(const std::vector<uint8_t>& encryptedData) {
         if (encryptedData.empty() || encryptedData.size() > MAX_FRAME_SIZE) {

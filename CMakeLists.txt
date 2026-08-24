@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CustomVPN CXX)
+project(CustomVPN C CXX)
 
 # --- ¡¿«Œ¬€≈ Õ¿—“–Œ… » C++ ---
 set(CMAKE_CXX_STANDARD 20)
@@ -52,7 +52,7 @@ else()
 endif()
 
 # --- œŒ»—  QT6 (ƒÀﬂ GUI) ---
-if(BUILD_GUI)
+if(BUILD_GUI AND WIN32)
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTOUIC ON)
     set(CMAKE_AUTORCC ON)
@@ -71,22 +71,66 @@ file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/core/*.h"
 )
 
+# --- «¿√–”« ¿ » Õ¿—“–Œ… ¿ LWIP ---
+include(FetchContent)
+FetchContent_Declare(
+    lwip
+    GIT_REPOSITORY https://github.com/lwip-tcpip/lwip.git
+    GIT_TAG        STABLE-2_2_0_RELEASE
+    GIT_SHALLOW    TRUE
+)
+FetchContent_Populate(lwip)
+
+file(GLOB_RECURSE LWIP_SOURCES 
+    "${lwip_SOURCE_DIR}/src/core/*.c"
+    "${lwip_SOURCE_DIR}/src/api/*.c"
+    "${lwip_SOURCE_DIR}/src/netif/*.c"
+)
+
+add_library(lwip STATIC ${LWIP_SOURCES})
+
+# ¬¿∆ÕŒ: ƒÓ·‡‚ÎˇÂÏ include ‰ËÂÍÚÓËË, ˜ÚÓ·˚ lwIP ‚Ë‰ÂÎ Ò‚ÓË Á‡„ÓÎÓ‚ÍË
+target_include_directories(lwip PUBLIC 
+    ${lwip_SOURCE_DIR}/src/include
+    ${CMAKE_CURRENT_SOURCE_DIR} 
+)
+
+# œ–»Õ”ƒ»“≈À‹ÕŒ ¬ Àﬁ◊¿≈Ã Ã¿ –Œ—€. ›ÚÓ Â¯ËÚ LNK2019
+target_compile_definitions(lwip PUBLIC 
+    LWIP_UDP=1 
+    NO_SYS=1 
+    LWIP_IPV4=1 
+    LWIP_TCP=1
+)
+
+if(MSVC)
+    target_compile_options(lwip PRIVATE /W3 /utf-8)
+    target_compile_definitions(lwip PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+
+# --- 1. —Õ¿◊¿À¿ —Œ«ƒ¿≈Ã “¿–√≈“ vpn_core ---
 add_library(vpn_core STATIC ${CORE_SOURCES})
 
+# --- 2. œŒ“ŒÃ Õ¿—“–¿»¬¿≈Ã ≈√Œ ---
 target_compile_features(vpn_core PUBLIC cxx_std_20)
 
 target_include_directories(vpn_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/core/include
     ${OPENSSL_INCLUDE_DIR}
     ${Boost_INCLUDE_DIRS}
+    ${lwip_SOURCE_DIR}/src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/client/include
 )
 
 target_link_libraries(vpn_core PUBLIC 
     "${OPENSSL_CRYPTO_LIBRARY}"
     "${OPENSSL_SSL_LIBRARY}"
+    lwip
 )
 
 if(WIN32)
@@ -106,6 +150,7 @@ if(BUILD_SERVER)
     )
 
     add_executable(vpn_server ${SERVER_SOURCES})
+
     target_include_directories(vpn_server PRIVATE 
         ${CMAKE_CURRENT_SOURCE_DIR}/server
         ${CMAKE_CURRENT_SOURCE_DIR}/server/include
@@ -173,7 +218,6 @@ file(GLOB_RECURSE CLIENT_SOURCES CONFIGURE_DEPENDS
 )
 
 add_executable(vpn_cli_client ${CLIENT_SOURCES})
-
 target_include_directories(vpn_cli_client PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/client
     ${CMAKE_CURRENT_SOURCE_DIR}/client/include

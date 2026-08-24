@@ -209,4 +209,80 @@ namespace Vpn {
         return true;
     }
 
+    // Новый конструктор: инициализация из сырого массива байтов
+    CryptoEngine::CryptoEngine(const std::vector<uint8_t>& privateKey) {
+        if (privateKey.size() != 32) {
+            throw std::invalid_argument("CryptoEngine: Private key must be exactly 32 bytes for X25519");
+        }
+
+        EVP_PKEY* rawKey = EVP_PKEY_new_raw_private_key(
+            EVP_PKEY_X25519,
+            nullptr,
+            privateKey.data(),
+            privateKey.size()
+        );
+
+        if (!rawKey) {
+            throw std::runtime_error("CryptoEngine: Failed to import X25519 private key");
+        }
+
+        LocalKeyPair.reset(rawKey);
+    }
+
+    // Извлечение сырых байтов приватного ключа (аналогично GetLocalPublicKey)
+    std::vector<uint8_t> CryptoEngine::GetLocalPrivateKey() const {
+        if (!LocalKeyPair) return {};
+
+        size_t len = 0;
+        if (EVP_PKEY_get_raw_private_key(LocalKeyPair.get(), nullptr, &len) != 1) {
+            return {};
+        }
+
+        std::vector<uint8_t> privKey(len);
+        if (EVP_PKEY_get_raw_private_key(LocalKeyPair.get(), privKey.data(), &len) != 1) {
+            return {};
+        }
+
+        return privKey;
+    }
+
+    std::string CryptoEngine::Base64Encode(const std::vector<uint8_t>& data) {
+        if (data.empty()) return "";
+
+        size_t outputLen = 4 * ((data.size() + 2) / 3);
+        std::string encoded(outputLen, '\0');
+
+        int encodedLen = EVP_EncodeBlock(
+            reinterpret_cast<unsigned char*>(&encoded[0]),
+            data.data(),
+            static_cast<int>(data.size())
+        );
+
+        encoded.resize(static_cast<size_t>(encodedLen));
+        return encoded;
+    }
+
+    std::vector<uint8_t> CryptoEngine::Base64Decode(const std::string& input) {
+        if (input.empty()) return {};
+
+        size_t maxDecodedLen = 3 * ((input.size() + 3) / 4);
+        std::vector<uint8_t> decoded(maxDecodedLen);
+
+        int decodedLen = EVP_DecodeBlock(
+            decoded.data(),
+            reinterpret_cast<const unsigned char*>(input.data()),
+            static_cast<int>(input.size())
+        );
+
+        if (decodedLen < 0) return {};
+
+        // Учитываем паддинг ('='), так как EVP_DecodeBlock возвращает длину без учета '='
+        size_t padding = 0;
+        if (input.size() >= 1 && input[input.size() - 1] == '=') padding++;
+        if (input.size() >= 2 && input[input.size() - 2] == '=') padding++;
+
+        decoded.resize(static_cast<size_t>(decodedLen) - padding);
+        return decoded;
+    }
+
 } // namespace Vpn

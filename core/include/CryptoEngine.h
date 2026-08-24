@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
+#include <iostream>
 
 typedef struct evp_pkey_st EVP_PKEY;
 typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
@@ -25,13 +26,16 @@ class CryptoEngine {
 public:
     CryptoEngine();
     ~CryptoEngine() = default;
+    explicit CryptoEngine(const std::vector<uint8_t>& staticPrivateKey);
 
     CryptoEngine(const CryptoEngine&) = delete;
     CryptoEngine& operator=(const CryptoEngine&) = delete;
 
     std::vector<uint8_t> GetLocalPublicKey() const;
+    std::vector<uint8_t> GetLocalPrivateKey() const;
     std::vector<uint8_t> DeriveSharedSecret(const std::vector<uint8_t>& peerPublicKey);
-
+    
+    void InitFromPrivateKey(const std::vector<uint8_t>& privateKey);
     // --- Реализуемые функции ---
     static std::vector<uint8_t> GenerateRandomBytes(size_t Size);
 
@@ -50,6 +54,9 @@ public:
         const std::vector<uint8_t>& AuthTag,
         std::vector<uint8_t>& OutPlainText
     );
+
+    static std::string Base64Encode(const std::vector<uint8_t>& data);
+    static std::vector<uint8_t> Base64Decode(const std::string& input);
 
 private:
     bool GenerateKeyPair();

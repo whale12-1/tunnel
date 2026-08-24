@@ -22,10 +22,18 @@ namespace Vpn::Client {
         void DoAccept() {
             m_acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
                 if (!ec) {
-                    // Передаем ровно 2 аргумента: сокет и транспорт
-                    std::make_shared<LocalProxySession>(
-                        std::move(socket), m_transport
-                    )->Start();
+                    // Проверяем, жив ли туннель, прежде чем пускать локальный трафик
+                    if (m_transport && m_transport->IsConnected()) {
+                        std::make_shared<LocalProxySession>(
+                            std::move(socket), m_transport
+                        )->Start();
+                    }
+                    else {
+                        // Мгновенно сбрасываем соединение, чтобы браузер не висел,
+                        // а попытался переподключиться позже или выдал ошибку ERR_CONNECTION_REFUSED
+                        boost::system::error_code closeEc;
+                        socket.close(closeEc);
+                    }
                 }
                 DoAccept();
                 });

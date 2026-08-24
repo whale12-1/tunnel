@@ -35,6 +35,7 @@ namespace Vpn::Protocol {
         AddressType type{ AddressType::IPv4 };
         std::string address;
         uint16_t port{ 0 };
+        bool isUdp{ false };
     };
 
     // Распакованная структура Mux-кадра

@@ -15,10 +15,10 @@ int main() {
         boost::asio::io_context ioContext;
 
         // Слушаем порт 8080 для входящих VPN-клиентов
-        Vpn::Server::Server server(ioContext, 8080);
+        Vpn::Server::Server server(ioContext, 18080);
         server.Start();
 
-        std::cout << "[VPN Server] Started on port 8080..." << std::endl;
+        std::cout << "[VPN Server] Started on port 18080..." << std::endl;
         ioContext.run();
     }
     catch (const std::exception& e) {

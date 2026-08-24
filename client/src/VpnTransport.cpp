@@ -1,5 +1,5 @@
 ﻿#include "VpnTransport.h"
-#include "TlsHelper.h"
+#include "TLSHelper.h"
 #include <iostream>
 
 namespace Vpn::Client {
@@ -7,14 +7,16 @@ namespace Vpn::Client {
     VpnTransport::VpnTransport(boost::asio::io_context& ioContext,
         std::string serverIp,
         uint16_t serverPort,
-        std::vector<uint8_t> serverPublicKey)
+        std::vector<uint8_t> serverPublicKey,
+        std::string sniHost)
         : m_ioContext(ioContext),
         m_vpnSocket(ioContext),
         m_serverIp(std::move(serverIp)),
         m_serverPort(serverPort),
         m_serverPublicKey(std::move(serverPublicKey)),
         m_pingTimer(ioContext),
-        m_reconnectTimer(ioContext)
+        m_reconnectTimer(ioContext),
+        m_sniHost("dl.google.com")
     {
     }
 
@@ -28,8 +30,19 @@ namespace Vpn::Client {
     }
 
     void VpnTransport::UnregisterStream(uint32_t streamId) {
-        std::lock_guard<std::recursive_mutex> lock(m_handlersMutex);
-        m_streamHandlers.erase(streamId);
+        FrameHandler handler_to_destroy;
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_handlersMutex);
+            auto it = m_streamHandlers.find(streamId);
+            if (it != m_streamHandlers.end()) {
+                // Перемещаем лямбду во временную переменную, чтобы ее 
+                // внутренний деструктор не вызвался внутри метода erase()
+                handler_to_destroy = std::move(it->second);
+                m_streamHandlers.erase(it);
+            }
+        }
+        // Разрушение лямбды и вызов деструкторов сессий 
+        // безопасно произойдут здесь, вне критической секции контейнера
     }
 
     void VpnTransport::Connect(std::function<void(bool success)> onConnected) {
@@ -40,69 +53,101 @@ namespace Vpn::Client {
             m_vpnSocket.close(socketEc);
         }
 
-        tcp::endpoint endpoint(boost::asio::ip::make_address(m_serverIp), m_serverPort);
+        std::cout << "[VpnTransport] Resolving host " << m_serverIp << ":" << m_serverPort << "...\n";
 
-        m_vpnSocket.async_connect(endpoint, [this, self, onConnected](boost::system::error_code ec) {
-            if (ec) {
-                if (onConnected) onConnected(false);
-                return;
-            }
+        // Создаем резолвер и захватываем его в лямбду, чтобы он жил до конца запроса
+        auto resolver = std::make_shared<boost::asio::ip::tcp::resolver>(m_ioContext);
 
-            m_vpnSocket.set_option(boost::asio::ip::tcp::no_delay(true));
-            auto myPubKey = m_cryptoEngine.GetLocalPublicKey();
+        resolver->async_resolve(m_serverIp, std::to_string(m_serverPort),
+            [this, self, onConnected, resolver](const boost::system::error_code& resolveEc, boost::asio::ip::tcp::resolver::results_type results) {
+                if (resolveEc) {
+                    std::cerr << "[VpnTransport ERROR] DNS Resolve failed: " << resolveEc.message() << "\n";
+                    if (onConnected) onConnected(false);
+                    return;
+                }
 
-            auto tlsPacket = Protocol::TlsHelper::BuildClientHello("dl.google.com", myPubKey, m_serverPublicKey);
-            if (tlsPacket.empty()) {
-                if (onConnected) onConnected(false);
-                return;
-            }
+                std::cout << "[VpnTransport] DNS resolved. Connecting TCP...\n";
 
-            auto fullTlsPacket = std::make_shared<std::vector<uint8_t>>(std::move(tlsPacket));
+                // async_connect сам попытается подключиться к первому доступному IP из results
+                boost::asio::async_connect(m_vpnSocket, results,
+                    [this, self, onConnected](boost::system::error_code connectEc, const boost::asio::ip::tcp::endpoint& endpoint) {
+                        if (connectEc) {
+                            std::cerr << "[VpnTransport ERROR] TCP Connect failed: " << connectEc.message()
+                                << " (code: " << connectEc.value() << ")\n";
+                            if (onConnected) onConnected(false);
+                            return;
+                        }
 
-            boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*fullTlsPacket),
-                [this, self, onConnected, fullTlsPacket](boost::system::error_code writeEc, size_t) {
-                    if (writeEc) { if (onConnected) onConnected(false); return; }
+                        std::cout << "[VpnTransport] TCP connected to " << endpoint.address().to_string() << ". Sending ClientHello...\n";
 
-                    auto headerBuf = std::make_shared<std::vector<uint8_t>>(5);
+                        m_vpnSocket.set_option(boost::asio::ip::tcp::no_delay(true));
+                        auto myPubKey = m_cryptoEngine.GetLocalPublicKey();
 
-                    boost::asio::async_read(m_vpnSocket, boost::asio::buffer(*headerBuf),
-                        [this, self, onConnected, headerBuf](boost::system::error_code readEc, size_t) {
-                            if (readEc) { if (onConnected) onConnected(false); return; }
+                        auto tlsPacket = Protocol::TlsHelper::BuildClientHello(m_sniHost, myPubKey, m_serverPublicKey);
+                        if (tlsPacket.empty()) {
+                            std::cerr << "[VpnTransport ERROR] Failed to build ClientHello (check key validity)!\n";
+                            if (onConnected) onConnected(false);
+                            return;
+                        }
 
-                            uint16_t bodyLen = ((*headerBuf)[3] << 8) | (*headerBuf)[4];
-                            auto fullServerHello = std::make_shared<std::vector<uint8_t>>(5 + bodyLen);
-                            std::memcpy(fullServerHello->data(), headerBuf->data(), 5);
+                        auto fullTlsPacket = std::make_shared<std::vector<uint8_t>>(std::move(tlsPacket));
 
-                            boost::asio::async_read(m_vpnSocket, boost::asio::buffer(fullServerHello->data() + 5, bodyLen),
-                                [this, self, onConnected, fullServerHello](boost::system::error_code readBodyEc, size_t) {
-                                    if (readBodyEc) { if (onConnected) onConnected(false); return; }
+                        boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*fullTlsPacket),
+                            [this, self, onConnected, fullTlsPacket](boost::system::error_code writeEc, size_t bytesSent) {
+                                if (writeEc) {
+                                    std::cerr << "[VpnTransport ERROR] Write ClientHello failed: " << writeEc.message() << "\n";
+                                    if (onConnected) onConnected(false);
+                                    return;
+                                }
 
-                                    std::vector<uint8_t> serverPubKey;
-                                    if (!Protocol::TlsHelper::ParseServerHello(*fullServerHello, serverPubKey)) {
-                                        if (onConnected) onConnected(false);
-                                        return;
-                                    }
+                                std::cout << "[VpnTransport] ClientHello sent (" << bytesSent << " bytes). Waiting for ServerHello...\n";
 
-                                    m_sessionKey = m_cryptoEngine.DeriveSharedSecret(serverPubKey);
-                                    if (m_sessionKey.empty()) {
-                                        if (onConnected) onConnected(false);
-                                        return;
-                                    }
+                                auto headerBuf = std::make_shared<std::vector<uint8_t>>(5);
 
-                                    auto ccsBuf = std::make_shared<std::vector<uint8_t>>(
-                                        std::initializer_list<uint8_t>{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
-                                    );
+                                boost::asio::async_read(m_vpnSocket, boost::asio::buffer(*headerBuf),
+                                    [this, self, onConnected, headerBuf](boost::system::error_code readEc, size_t) {
+                                        if (readEc) {
+                                            std::cerr << "[VpnTransport ERROR] Read ServerHello header failed: "
+                                                << readEc.message() << " (Server rejected connection or closed socket)\n";
+                                            if (onConnected) onConnected(false);
+                                            return;
+                                        }
 
-                                    boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*ccsBuf),
-                                        [this, self, onConnected, ccsBuf](boost::system::error_code ccsEc, size_t) {
-                                            if (ccsEc) { if (onConnected) onConnected(false); return; }
+                                        std::cout << "[VpnTransport] ServerHello header received successfully!\n";
 
-                                            // Вычитываем зашифрованную цепочку сертификатов (0x17) от сервера
-                                            DoReadHandshakeCertPayload(onConnected);
-                                        });
-                                });
-                        });
-                });
+                                        uint16_t bodyLen = ((*headerBuf)[3] << 8) | (*headerBuf)[4];
+                                        auto fullServerHello = std::make_shared<std::vector<uint8_t>>(5 + bodyLen);
+                                        std::memcpy(fullServerHello->data(), headerBuf->data(), 5);
+
+                                        boost::asio::async_read(m_vpnSocket, boost::asio::buffer(fullServerHello->data() + 5, bodyLen),
+                                            [this, self, onConnected, fullServerHello](boost::system::error_code readBodyEc, size_t) {
+                                                if (readBodyEc) { if (onConnected) onConnected(false); return; }
+
+                                                std::vector<uint8_t> serverPubKey;
+                                                if (!Protocol::TlsHelper::ParseServerHello(*fullServerHello, serverPubKey)) {
+                                                    if (onConnected) onConnected(false);
+                                                    return;
+                                                }
+
+                                                m_sessionKey = m_cryptoEngine.DeriveSharedSecret(serverPubKey);
+                                                if (m_sessionKey.empty()) {
+                                                    if (onConnected) onConnected(false);
+                                                    return;
+                                                }
+
+                                                auto ccsBuf = std::make_shared<std::vector<uint8_t>>(
+                                                    std::initializer_list<uint8_t>{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
+                                                );
+
+                                                boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*ccsBuf),
+                                                    [this, self, onConnected, ccsBuf](boost::system::error_code ccsEc, size_t) {
+                                                        if (ccsEc) { if (onConnected) onConnected(false); return; }
+                                                        DoReadHandshakeCertPayload(onConnected);
+                                                    });
+                                            });
+                                    });
+                            });
+                    });
             });
     }
 

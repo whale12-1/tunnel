@@ -23,7 +23,9 @@ namespace Vpn::Client {
         explicit VpnTransport(boost::asio::io_context& ioContext,
             std::string serverIp,
             uint16_t serverPort,
-            std::vector<uint8_t> serverPublicKey);
+            std::vector<uint8_t> serverPublicKey,
+            std::string sniHost = "dl.google.com");
+
 
         // Управление подключением к VPN
         void Connect(std::function<void(bool success)> onConnected);
@@ -40,6 +42,8 @@ namespace Vpn::Client {
         void Close();
 
     private:
+        std::string m_sniHost;
+
 
         void DoReadFrameHeader();
         void DoReadFramePayload(uint16_t payloadLen);
