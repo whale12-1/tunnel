@@ -22,7 +22,7 @@ namespace Vpn::Server {
             return m_socket.get_executor();
         }
         void Start(FrameHandler onFrame, ErrorHandler onError);
-        void SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload);
+        void SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload, bool isInteractive);
         void Close();
 
     private:

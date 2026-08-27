@@ -51,7 +51,7 @@ namespace Vpn::Server {
         m_serverCrypto = std::make_shared<CryptoEngine>(config.privateKey);
 
         // --- ƒ»Ќјћ»„≈— јя —»Ќ’–ќЌ»«ј÷»я client.conf ¬ WINDOWS ---
-        namespace fs = std::filesystem;
+        /*namespace fs = std::filesystem;
         fs::path srcFile = "client.conf";
 
         // ѕути к папке отладки и к корню проекта в Windows
@@ -97,7 +97,7 @@ namespace Vpn::Server {
                     }
                 }
             }
-        }
+        }*/
     }
 
     void Server::Start() {

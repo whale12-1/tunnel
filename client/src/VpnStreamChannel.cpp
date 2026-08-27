@@ -19,29 +19,35 @@ namespace Vpn::Client {
     }
 
     void VpnStreamChannel::OpenVpnStream(const Protocol::TargetAddress& target) {
-        std::cout << "[Client Proxy] Opening VPN stream #" << m_streamId << " for " << target.address << ":" << target.port << "\n";
+        // Сохраняем флаг интерактивности для текущего потока
+        m_isInteractive = target.isInteractive;
+
+        std::cout << "[Client Proxy] Opening VPN stream #" << m_streamId
+            << " for " << target.address << ":" << target.port
+            << " (Interactive: " << (m_isInteractive ? "true" : "false") << ")\n";
+
         auto targetPayload = Protocol::StreamFrameHelper::SerializeTargetAddress(target);
         if (m_transport) {
-            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamOpen, targetPayload);
+            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamOpen, targetPayload, m_isInteractive);
         }
     }
 
     void VpnStreamChannel::SendData(const std::vector<uint8_t>& data) {
         if (m_transport && m_streamId != 0) {
-            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamData, data);
+            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamData, data, m_isInteractive);
         }
     }
 
     void VpnStreamChannel::SendHalfClose() {
         if (m_transport && m_streamId != 0) {
-            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamHalfClose, {});
+            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamHalfClose, {}, m_isInteractive);
         }
     }
 
     void VpnStreamChannel::SendCloseAndUnregister() {
         if (m_streamId != 0 && m_transport) {
             std::cout << "[Client Proxy] Closing session for stream #" << m_streamId << "\n";
-            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamClose, {});
+            m_transport->SendMuxFrame(m_streamId, Protocol::Command::StreamClose, {}, m_isInteractive);
             m_transport->UnregisterStream(m_streamId);
             m_streamId = 0;
         }

@@ -5,20 +5,24 @@
 #include <vector>
 #include <deque>
 #include <array>
+#include <atomic>
+#include <boost/asio/steady_timer.hpp>
 
 namespace Vpn::Client {
 
+    using BackpressureCheck = std::function<bool()>;
     using boost::asio::ip::tcp;
+    
 
     class AppSocketChannel : public std::enable_shared_from_this<AppSocketChannel> {
     public:
         using DataCallback = std::function<void(const std::vector<uint8_t>& data)>;
         using HalfCloseCallback = std::function<void()>;
         using ErrorCallback = std::function<void()>;
+        void StartReading(uint32_t streamId, DataCallback onData, HalfCloseCallback onHalfClose, ErrorCallback onError, BackpressureCheck isCongested = nullptr);
 
         explicit AppSocketChannel(tcp::socket socket);
 
-        void StartReading(uint32_t streamId, DataCallback onData, HalfCloseCallback onHalfClose, ErrorCallback onError);
         void Write(uint32_t streamId, const uint8_t* data, size_t length, ErrorCallback onError);
         void ShutdownSend();
         void Close();
@@ -40,6 +44,10 @@ namespace Vpn::Client {
         DataCallback m_onData;
         HalfCloseCallback m_onHalfClose;
         ErrorCallback m_onError;
+
+        BackpressureCheck m_isCongested;
+        std::unique_ptr<boost::asio::steady_timer> m_backpressureTimer;
+        std::atomic<size_t> m_pendingAppWriteBytes{ 0 };
     };
 
 } // namespace Vpn::Client

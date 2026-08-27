@@ -58,13 +58,18 @@ namespace Vpn::Protocol {
     }
 
     // -------------------------------------------------------------------
-        // 2. Сериализация и Парсинг адресов назначения (TargetAddress)
-        // -------------------------------------------------------------------
+    // 2. Сериализация и Парсинг адресов назначения (TargetAddress)
+    // -------------------------------------------------------------------
     std::vector<uint8_t> StreamFrameHelper::SerializeTargetAddress(const TargetAddress& target) {
         std::vector<uint8_t> buffer;
 
         buffer.push_back(static_cast<uint8_t>(target.type));
-        buffer.push_back(target.isUdp ? 0x01 : 0x00); // Записываем флаг UDP (1 байт)
+
+        // Битовые флаги: Bit 0 — isUdp, Bit 1 — isInteractive
+        uint8_t flags = 0;
+        if (target.isUdp)         flags |= 0x01;
+        if (target.isInteractive) flags |= 0x02;
+        buffer.push_back(flags);
 
         if (target.type == AddressType::IPv4) {
             in_addr addr{};
@@ -101,11 +106,15 @@ namespace Vpn::Protocol {
     }
 
     bool StreamFrameHelper::DeserializeTargetAddress(const uint8_t* buffer, size_t size, TargetAddress& outTarget) {
-        if (!buffer || size < 4) return false; // Минимально: AddrType(1B) + isUdp(1B) + Port(2B) = 4B
+        if (!buffer || size < 4) return false; // Минимально: AddrType(1B) + Flags(1B) + Port(2B) = 4B
 
         size_t offset = 0;
         outTarget.type = static_cast<AddressType>(buffer[offset++]);
-        outTarget.isUdp = (buffer[offset++] != 0); // Читаем флаг UDP
+
+        // Чтение битовых флагов
+        uint8_t flags = buffer[offset++];
+        outTarget.isUdp = (flags & 0x01) != 0;
+        outTarget.isInteractive = (flags & 0x02) != 0;
 
         if (outTarget.type == AddressType::IPv4) {
             if (size < offset + 4 + 2) return false;
@@ -122,7 +131,7 @@ namespace Vpn::Protocol {
                 return false;
             }
         }
-        else if (outTarget.type == AddressType::Domain) { // Исправлено на outTarget.type
+        else if (outTarget.type == AddressType::Domain) {
             if (size < offset + 1) return false;
 
             uint8_t domainLen = buffer[offset++];
@@ -156,6 +165,7 @@ namespace Vpn::Protocol {
 
         return true;
     }
+
     // -------------------------------------------------------------------
     // 3. Формирование и парсинг TCP-кадра сети (2-байтовый заголовок длины)
     // -------------------------------------------------------------------

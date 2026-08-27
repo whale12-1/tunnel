@@ -22,10 +22,21 @@ namespace Vpn::Client {
 
         m_socksHandler->Start(
             [this, self](const Protocol::TargetAddress& target) {
-                if (target.type == Protocol::AddressType::Domain) {
-                    m_sniHost = target.address;
+                // --- НАЧАЛО ИЗМЕНЕНИЙ ---
+                // Создаем копию, так как исходный target передается по константной ссылке
+                Protocol::TargetAddress mutableTarget = target;
+
+                if (mutableTarget.type == Protocol::AddressType::Domain) {
+                    m_sniHost = mutableTarget.address;
                 }
-                m_streamChannel->OpenVpnStream(target);
+
+                // Простая эвристика для SOCKS (SSH, DNS, RDP)
+                if (mutableTarget.port == 22 || mutableTarget.port == 53 || mutableTarget.port == 3389) {
+                    mutableTarget.isInteractive = true;
+                }
+
+                m_streamChannel->OpenVpnStream(mutableTarget);
+                // --- КОНЕЦ ИЗМЕНЕНИЙ ---
             },
             [this, self]() {
                 Close();
@@ -54,7 +65,11 @@ namespace Vpn::Client {
                         },
                         [this, self]() {
                             Close();
+                        },
+                        [this, self]() { 
+                            return m_streamChannel->IsTransportCongested(); 
                         }
+
                     );
                 },
                 [this, self]() {

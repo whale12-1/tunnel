@@ -13,6 +13,10 @@ namespace Vpn::Server {
     void MuxConnection::Start(FrameHandler onFrame, ErrorHandler onError) {
         m_onFrame = std::move(onFrame);
         m_onError = std::move(onError);
+
+        boost::system::error_code ec;
+        m_socket.set_option(tcp::no_delay(true), ec); // Отключаем задержку Нагла
+
         DoReadFrameHeader();
     }
 
@@ -79,7 +83,7 @@ namespace Vpn::Server {
         }
 
         if (frame.command == Protocol::Command::Ping) {
-            SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Pong, {});
+            SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Pong, {}, true); // Системный Pong отправляется как интерактивный
         }
         else if (m_onFrame) {
             m_onFrame(frame);
@@ -88,10 +92,20 @@ namespace Vpn::Server {
         DoReadFrameHeader();
     }
 
-    void MuxConnection::SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload) {
+    void MuxConnection::SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload, bool isInteractive) {
+        if (!m_socket.is_open()) return;
+
         size_t offset = 0;
         static thread_local std::mt19937 rng(std::random_device{}());
-        std::uniform_int_distribution<size_t> chunkDist(6000, 14500);
+
+        // Адаптируем размер кадров и паддинга
+        size_t minChunk = isInteractive ? 256 : 4096;
+        size_t maxChunk = isInteractive ? 2048 : 14336;
+        size_t minPad = isInteractive ? 0 : 16;
+        size_t maxPad = isInteractive ? 16 : 128;
+
+        std::uniform_int_distribution<size_t> chunkDist(minChunk, maxChunk);
+        std::uniform_int_distribution<size_t> padDist(minPad, maxPad);
 
         do {
             size_t currentChunkLimit = chunkDist(rng);
@@ -101,7 +115,6 @@ namespace Vpn::Server {
             if (chunkSize > 0) chunk.assign(payload.begin() + offset, payload.begin() + offset + chunkSize);
 
             auto plainMux = Protocol::StreamFrameHelper::PackMuxFrame(streamId, cmd, chunk);
-            std::uniform_int_distribution<size_t> padDist(16, 128);
             auto padded = Protocol::PaddingHelper::AddPadding(plainMux, padDist(rng));
             auto iv = CryptoEngine::GenerateRandomBytes(Protocol::IV_SIZE);
 

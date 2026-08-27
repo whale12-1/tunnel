@@ -33,10 +33,11 @@ namespace Vpn::Client {
         netif->name[0] = 't';
         netif->name[1] = 'u';
         netif->output = LwipNetifOutput;
-        netif->mtu = 1280;
+        netif->mtu = 1420;
         netif->flags = NETIF_FLAG_UP | NETIF_FLAG_LINK_UP;
         return ERR_OK;
     }
+
 
     void Tun2SocksEngine::Init() {
         lwip_init();
@@ -108,6 +109,13 @@ namespace Vpn::Client {
         tcp_sum = ~tcp_sum;
         packet[ip_header_len + 16] = (tcp_sum >> 8) & 0xFF;
         packet[ip_header_len + 17] = tcp_sum & 0xFF;
+    }
+
+    bool Tun2SocksEngine::IsInteractivePacket(uint8_t protocol, uint16_t dstPort, size_t payloadLen, bool hasPsh) {
+        if (dstPort == 22 || dstPort == 53 || dstPort == 3389) return true; // SSH, DNS, RDP
+        if (protocol == IPPROTO_UDP && payloadLen < 500) return true;      // Быстрый UDP/DNS/QUIC
+        if (protocol == IPPROTO_TCP && hasPsh && payloadLen < 200) return true; // TCP PSH с малым payload
+        return false;
     }
 
     void Tun2SocksEngine::OnIpPacketFromOs(const uint8_t* data, size_t length) {
@@ -192,6 +200,9 @@ namespace Vpn::Client {
                 target.port = dst_port;
                 target.isUdp = true;
 
+                // --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+                target.isInteractive = IsInteractivePacket(protocol, dst_port, udp_payload_len, false);
+
                 // Регистрируем обработчик входящих ответов от сервера для этого UDP-потока
                 streamChannel->RegisterStream([this, src_port](const Protocol::MuxFrame& frame) {
                     OnServerUdpData(src_port, frame);
@@ -274,8 +285,25 @@ namespace Vpn::Client {
         return ERR_OK;
     }
 
+    void Tun2SocksEngine::OnServerTcpData(uint32_t streamId, const Protocol::MuxFrame& frame) {
+        auto it = m_tcpContexts.find(streamId);
+        if (it == m_tcpContexts.end() || it->second->pcb == nullptr) return;
+
+        auto* ctx = it->second.get();
+
+        if (frame.command == Protocol::Command::StreamData) {
+            ctx->txQueue.push_back(frame.payload);
+            TrySendTcpData(ctx);
+        }
+        else if (frame.command == Protocol::Command::StreamHalfClose || frame.command == Protocol::Command::StreamClose) {
+            // Не удаляем сразу! Отмечаем, что сервер закончил передачу, и досылаем остатки
+            ctx->serverClosed = true;
+            TrySendTcpData(ctx);
+        }
+    }
+
     void Tun2SocksEngine::TrySendTcpData(LwipTcpContext* ctx) {
-        if (!ctx->pcb) return;
+        if (!ctx || !ctx->pcb) return;
 
         while (!ctx->txQueue.empty()) {
             auto& data = ctx->txQueue.front();
@@ -294,31 +322,16 @@ namespace Vpn::Client {
                     data.erase(data.begin(), data.begin() + to_write);
                 }
             }
-            else if (err == ERR_MEM) {
-                break;
-            }
             else {
                 break;
             }
         }
         tcp_output(ctx->pcb);
-    }
 
-    void Tun2SocksEngine::OnServerTcpData(uint32_t streamId, const Protocol::MuxFrame& frame) {
-        auto it = m_tcpContexts.find(streamId);
-        if (it == m_tcpContexts.end() || it->second->pcb == nullptr) return;
-
-        if (frame.command == Protocol::Command::StreamData) {
-            it->second->txQueue.push_back(frame.payload);
-            TrySendTcpData(it->second.get());
-        }
-        else if (frame.command == Protocol::Command::StreamHalfClose) {
-            if (it->second->pcb) {
-                tcp_shutdown(it->second->pcb, 0, 1);
-            }
-        }
-        else if (frame.command == Protocol::Command::StreamClose) {
-            RemoveTcpConnection(streamId); // А вот тут убиваем полностью
+        // Удаляем соединение ТОЛЬКО после полного опустошения очереди txQueue
+        if (ctx->txQueue.empty() && ctx->serverClosed) {
+            uint32_t streamId = ctx->streamId;
+            RemoveTcpConnection(streamId);
         }
     }
 
@@ -401,6 +414,8 @@ namespace Vpn::Client {
                 target.address = ipStr;
                 target.port = newpcb->local_port;
             }
+            target.isInteractive = engine->IsInteractivePacket(IPPROTO_TCP, target.port, 0, false);
+
         }
 
         streamChannel->RegisterStream([engine, streamId](const Protocol::MuxFrame& frame) {
@@ -412,12 +427,22 @@ namespace Vpn::Client {
         return ERR_OK;
     }
 
+    // TunToSocksEngine.cpp
     signed char Tun2SocksEngine::LwipTcpRecv(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, signed char err) {
         auto* ctx = static_cast<LwipTcpContext*>(arg);
         if (!ctx) return ERR_OK;
 
         if (p == nullptr) {
-            ctx->engine->RemoveTcpConnection(ctx->streamId);
+            uint32_t streamId = ctx->streamId;
+            auto it = ctx->engine->m_streams.find(streamId);
+            if (it != ctx->engine->m_streams.end()) {
+                it->second->SendHalfClose();
+            }
+
+            // Если сервер уже прислал закрытие и очередь пуста — закрываем окончательно
+            if (ctx->serverClosed && ctx->txQueue.empty()) {
+                ctx->engine->RemoveTcpConnection(streamId);
+            }
             return ERR_OK;
         }
 
@@ -513,7 +538,7 @@ namespace Vpn::Client {
         auto now = std::chrono::steady_clock::now();
         for (auto it = m_udpSessions.begin(); it != m_udpSessions.end(); ) {
             auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - it->second->lastActive).count();
-            if (duration > 60) { // Закрываем UDP-сессию после 30 секунд неактивности
+            if (duration > 15) { // 15 секунд неактивности достаточно для очистки UDP/DNS
                 it->second->streamChannel->SendCloseAndUnregister();
                 uint32_t streamId = it->second->streamId;
                 m_streams.erase(streamId);

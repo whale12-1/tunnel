@@ -37,7 +37,8 @@ namespace Vpn::Client {
         Tun2SocksEngine* engine = nullptr;
         uint32_t streamId = 0;
         struct tcp_pcb* pcb = nullptr;
-        std::deque<std::vector<uint8_t>> txQueue; // <-- ДОБАВЛЕНО
+        std::deque<std::vector<uint8_t>> txQueue;
+        bool serverClosed = false; // <-- Флаг: сервер завершил отправку данных
     };
 
     class Tun2SocksEngine : public std::enable_shared_from_this<Tun2SocksEngine> {
@@ -65,7 +66,7 @@ namespace Vpn::Client {
         void UpdateChecksums(uint8_t* packet, size_t len, uint16_t ip_header_len);
         void TrySendTcpData(LwipTcpContext* ctx);
         std::string IpToString(uint32_t ip);
-
+        bool IsInteractivePacket(uint8_t protocol, uint16_t dstPort, size_t payloadLen, bool hasPsh);
         static signed char LwipTcpSent(void* arg, struct tcp_pcb* tpcb, u16_t len);
         boost::asio::io_context& m_ioContext;
         boost::asio::steady_timer m_lwipTimer;

@@ -17,12 +17,12 @@ namespace Vpn::Protocol {
     constexpr uint32_t SYSTEM_STREAM_ID = 0;
 
     enum class Command : uint8_t {
-        Ping = 0x01, // Системный Heartbeat
-        Pong = 0x02, // Ответ на Heartbeat
-        StreamOpen = 0x03, // Запрос на открытие виртуального канала к TargetAddress
-        StreamData = 0x04, // Передача полезных данных в рамках StreamID
+        Ping = 0x01,            // Системный Heartbeat
+        Pong = 0x02,            // Ответ на Heartbeat
+        StreamOpen = 0x03,      // Запрос на открытие виртуального канала к TargetAddress
+        StreamData = 0x04,      // Передача полезных данных в рамках StreamID
         StreamHalfClose = 0x05,
-        StreamClose = 0x06  // Закрытие конкретного StreamID
+        StreamClose = 0x06      // Закрытие конкретного StreamID
     };
 
     enum class AddressType : uint8_t {
@@ -36,6 +36,7 @@ namespace Vpn::Protocol {
         std::string address;
         uint16_t port{ 0 };
         bool isUdp{ false };
+        bool isInteractive{ false };
     };
 
     // Распакованная структура Mux-кадра
@@ -48,10 +49,7 @@ namespace Vpn::Protocol {
     class StreamFrameHelper {
     public:
         // --- 1. MUX УПАКОВКА И РАСПАКОВКА ---
-        // Собирает буфер: [StreamID (4B)][Command (1B)][Payload]
         static std::vector<uint8_t> PackMuxFrame(uint32_t streamId, Command cmd, const std::vector<uint8_t>& payload = {});
-
-        // Разбирает незашифрованный буфер в структуру MuxFrame
         static bool UnpackMuxFrame(const std::vector<uint8_t>& plainText, MuxFrame& outFrame);
 
         // --- 2. СЕРИАЛИЗАЦИЯ И ПАРСИНГ АДРЕСОВ НАЗНАЧЕНИЯ ---
@@ -65,7 +63,6 @@ namespace Vpn::Protocol {
 
     class PaddingHelper {
     public:
-        // Упаковывает полезные данные со случайным падингом (от 0 до maxPadding байт)
         static std::vector<uint8_t> AddPadding(const std::vector<uint8_t>& plainText, uint8_t maxPadding = 64) {
             std::mt19937 rng(std::random_device{}());
             std::uniform_int_distribution<uint16_t> dist(0, maxPadding);
@@ -74,13 +71,9 @@ namespace Vpn::Protocol {
             std::vector<uint8_t> paddedData;
             paddedData.reserve(1 + plainText.size() + padLen);
 
-            // 1. Первый байт — длина падинга
             paddedData.push_back(padLen);
-
-            // 2. Полезные данные
             paddedData.insert(paddedData.end(), plainText.begin(), plainText.end());
 
-            // 3. Случайные байты падинга
             for (uint8_t i = 0; i < padLen; ++i) {
                 paddedData.push_back(static_cast<uint8_t>(dist(rng) & 0xFF));
             }
@@ -88,13 +81,11 @@ namespace Vpn::Protocol {
             return paddedData;
         }
 
-        // Извлекает полезные данные, отбрасывая падинг
         static bool RemovePadding(const std::vector<uint8_t>& paddedData, std::vector<uint8_t>& outPlainText) {
             if (paddedData.empty()) return false;
 
             uint8_t padLen = paddedData[0];
 
-            // ЗАЩИТА: Если размер кадра меньше или равен 1 + padLen, значит кадр поврежден
             if (paddedData.size() <= static_cast<size_t>(1 + padLen)) {
                 return false;
             }

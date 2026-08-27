@@ -184,7 +184,7 @@ namespace Vpn::Client {
 
                         std::cout << "[Transport] REALITY TLS 1.3 Tunnel established successfully! Mux Active.\n";
 
-                        SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {});
+                        SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {}, false);
                         DoReadFrameHeader();
                         StartPingTimer();
 
@@ -278,30 +278,34 @@ namespace Vpn::Client {
         DoReadFrameHeader();
     }
 
-    void VpnTransport::SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload) {
+    // VpnTransport.cpp
+    void VpnTransport::SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload, bool isInteractive) {
         if (!m_isConnected) return;
 
         size_t offset = 0;
-
-        // Статический генератор случайных чисел для потока
         static thread_local std::mt19937 rng(std::random_device{}());
-        // Диапазон размеров куска (например, от 8000 до 14000 байт)
-        std::uniform_int_distribution<size_t> chunkDist(8000, 14000);
 
-        // Фрагментация на куски случайного размера
+        // Диапазоны размера чанков и паддинга:
+        // - isInteractive = true:  256 B – 2048 B (минимизация задержки)
+        // - isInteractive = false: 4096 B – 14336 B (~4–14 КБ, высокая пропускная способность + усложнение DPI)
+        size_t minChunk = isInteractive ? 256 : 4096;
+        size_t maxChunk = isInteractive ? 2048 : 14336;
+        size_t minPad = isInteractive ? 0 : 16;
+        size_t maxPad = isInteractive ? 16 : 128;
+
+        std::uniform_int_distribution<size_t> chunkDist(minChunk, maxChunk);
+        std::uniform_int_distribution<size_t> padDist(minPad, maxPad);
+
         do {
-            // Генерируем случайный лимит для текущего фрагмента
             size_t currentChunkLimit = chunkDist(rng);
-
             size_t chunkSize = payload.empty() ? 0 : std::min(payload.size() - offset, currentChunkLimit);
+
             std::vector<uint8_t> chunk;
             if (chunkSize > 0) {
                 chunk.assign(payload.begin() + offset, payload.begin() + offset + chunkSize);
             }
 
             auto plainMux = Protocol::StreamFrameHelper::PackMuxFrame(streamId, cmd, chunk);
-
-            std::uniform_int_distribution<size_t> padDist(16, 128);
             auto padded = Protocol::PaddingHelper::AddPadding(plainMux, padDist(rng));
             auto iv = CryptoEngine::GenerateRandomBytes(Protocol::IV_SIZE);
 
@@ -311,16 +315,19 @@ namespace Vpn::Client {
             }
 
             auto tlsRecord = std::make_shared<std::vector<uint8_t>>();
-            tlsRecord->push_back(0x17);
-            tlsRecord->push_back(0x03); tlsRecord->push_back(0x03);
+            tlsRecord->push_back(0x17); // TLS Application Data
+            tlsRecord->push_back(0x03); tlsRecord->push_back(0x03); // TLS 1.2 / 1.3
+
             uint16_t len = static_cast<uint16_t>(iv.size() + cipherText.size() + authTag.size());
             tlsRecord->push_back(len >> 8);
             tlsRecord->push_back(len & 0xFF);
+
             tlsRecord->insert(tlsRecord->end(), iv.begin(), iv.end());
             tlsRecord->insert(tlsRecord->end(), cipherText.begin(), cipherText.end());
             tlsRecord->insert(tlsRecord->end(), authTag.begin(), authTag.end());
 
             boost::asio::post(m_ioContext, [this, self = shared_from_this(), tlsRecord]() {
+                m_pendingWriteBytes += tlsRecord->size();
                 m_writeQueue.push_back(tlsRecord);
                 if (!m_isWriting) {
                     DoWriteQueue();
@@ -343,6 +350,7 @@ namespace Vpn::Client {
 
         boost::asio::async_write(m_vpnSocket, boost::asio::buffer(*bufferPtr),
             [this, self, bufferPtr](boost::system::error_code ec, size_t) {
+                m_pendingWriteBytes -= bufferPtr->size();
                 if (ec) { Close(); return; }
                 m_writeQueue.pop_front();
                 DoWriteQueue();
@@ -359,7 +367,7 @@ namespace Vpn::Client {
         m_pingTimer.expires_after(std::chrono::seconds(jitterSec));
         m_pingTimer.async_wait([this, self](boost::system::error_code ec) {
             if (!ec && m_isConnected) {
-                SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {});
+                SendMuxFrame(Protocol::SYSTEM_STREAM_ID, Protocol::Command::Ping, {},false);
                 StartPingTimer();
             }
             });

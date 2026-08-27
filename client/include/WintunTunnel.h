@@ -51,6 +51,7 @@ namespace Vpn::Client {
 
     private:
         void DoAsyncRead();
+        void ReadPackets();
         void ProcessIpPacket(const uint8_t* packetData, size_t length);
         bool LoadWintunFunctions();
 

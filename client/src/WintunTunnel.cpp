@@ -33,7 +33,14 @@ namespace Vpn::Client {
     }
 
     WintunTunnel::~WintunTunnel() {
+        // 1. Ожидаем завершения и отменяем все асинхронные задачи
         Stop();
+
+        // 2. Только после полной остановки и отмены хэндлеров выгружаем DLL
+        if (m_wintunDll) {
+            FreeLibrary(m_wintunDll);
+            m_wintunDll = nullptr;
+        }
     }
 
     bool WintunTunnel::LoadWintunFunctions() {
@@ -108,7 +115,6 @@ namespace Vpn::Client {
 
         std::string resolvedIp = serverHost; // По умолчанию оставляем как есть (если это уже IP)
         if (!ec && !results.empty()) {
-            // Ищем первый попавшийся IPv4 (Wintun роутинг в данном примере заточен под v4)
             for (const auto& res : results) {
                 if (res.endpoint().address().is_v4()) {
                     resolvedIp = res.endpoint().address().to_v4().to_string();
@@ -120,7 +126,6 @@ namespace Vpn::Client {
             std::cerr << "[Wintun Warning] Routing DNS resolve failed: " << ec.message() << "\n";
         }
 
-        // Сохраняем именно разрезолвленный IP, чтобы ClearRouting() смог корректно удалить маршрут
         m_serverIp = resolvedIp;
         std::cout << "[Wintun] Target routing IP resolved to: " << m_serverIp << "\n";
 
@@ -222,24 +227,31 @@ namespace Vpn::Client {
         DoAsyncRead();
     }
 
+    void WintunTunnel::ReadPackets() {
+        DWORD packetSize = 0;
+        while (!m_isStopping && m_session && pfnWintunReceivePacket) {
+            BYTE* packet = pfnWintunReceivePacket(m_session, &packetSize);
+            if (!packet) break;
+
+            ProcessIpPacket(packet, packetSize);
+
+            if (m_session && pfnWintunReleaseReceivePacket) {
+                pfnWintunReleaseReceivePacket(m_session, packet);
+            }
+        }
+    }
+
     void WintunTunnel::DoAsyncRead() {
         if (m_isStopping || !m_readWaitEvent) return;
 
         auto self = shared_from_this();
         m_readWaitEvent->async_wait([this, self](boost::system::error_code ec) {
-            if (ec || m_isStopping) return;
-
-            DWORD packetSize = 0;
-            while (!m_isStopping && m_session && pfnWintunReceivePacket) {
-                BYTE* packet = pfnWintunReceivePacket(m_session, &packetSize);
-                if (!packet) break;
-
-                ProcessIpPacket(packet, packetSize);
-
-                if (m_session && pfnWintunReleaseReceivePacket) {
-                    pfnWintunReleaseReceivePacket(m_session, packet);
-                }
+            // Если была отмена через Stop() или операция отменена ОС — выходим
+            if (ec == boost::asio::error::operation_aborted || ec || m_isStopping) {
+                return;
             }
+
+            ReadPackets();
 
             if (!m_isStopping) {
                 DoAsyncRead();
@@ -248,6 +260,9 @@ namespace Vpn::Client {
     }
 
     void WintunTunnel::ProcessIpPacket(const uint8_t* packetData, size_t length) {
+        if (m_transport && m_transport->IsCongested()) {
+            return;
+        }
         if (!m_isStopping && m_engine) {
             m_engine->OnIpPacketFromOs(packetData, length);
         }
@@ -264,40 +279,35 @@ namespace Vpn::Client {
     }
 
     void WintunTunnel::Stop() {
+        // Атомарно гарантируем, что Stop() выполнится только один раз
         bool expected = false;
         if (!m_isStopping.compare_exchange_strong(expected, true)) {
-            return; // Увидели, что остановка уже выполняется другим потоком
+            return;
         }
 
-        ClearRouting();
-
-        // 1. Сначала отменяем асинхронное ожидание событий
-        if (m_readWaitEvent) {
-            boost::system::error_code ec;
-            m_readWaitEvent->cancel(ec);
-            m_readWaitEvent.reset();
-        }
-
-        // 2. Уничтожаем движок lwIP
-        if (m_engine) {
-            m_engine.reset();
-        }
-
-        // 3. Закрываем сессию и адаптер Wintun
+        // 1. Завершаем сессию Wintun (драйвер отпускает системный event)
         if (m_session && pfnWintunEndSession) {
             pfnWintunEndSession(m_session);
             m_session = nullptr;
         }
 
+        // 2. Отменяем и закрываем хэндл асинхронного ожидания в Boost.Asio
+        if (m_readWaitEvent) {
+            boost::system::error_code ec;
+            m_readWaitEvent->cancel(ec); // Переводит колбэки в состояние operation_aborted
+            m_readWaitEvent->close(ec);  // Закрывает HANDLE на уровне Windows
+            m_readWaitEvent.reset();
+        }
+
+        // 3. Закрываем сам адаптер
         if (m_adapter && pfnWintunCloseAdapter) {
             pfnWintunCloseAdapter(m_adapter);
             m_adapter = nullptr;
         }
 
-        // 4. В последнюю очередь выгружаем DLL
-        if (m_wintunDll) {
-            FreeLibrary(m_wintunDll);
-            m_wintunDll = nullptr;
+        // 4. Очищаем движок tun2socks после остановки ввода-вывода
+        if (m_engine) {
+            m_engine.reset();
         }
     }
 

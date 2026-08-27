@@ -37,14 +37,14 @@ namespace Vpn::Client {
         void UnregisterStream(uint32_t streamId);
 
         // Отправка кадра в единую магистраль
-        void SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload = {});
-
+        void SendMuxFrame(uint32_t streamId, Protocol::Command cmd, const std::vector<uint8_t>& payload, bool isInteractive);
+        bool IsCongested() const { return m_pendingWriteBytes.load() > 4 * 1024 * 1024; }
         void Close();
 
     private:
         std::string m_sniHost;
 
-
+        std::atomic<size_t> m_pendingWriteBytes{ 0 };
         void DoReadFrameHeader();
         void DoReadFramePayload(uint16_t payloadLen);
         void ProcessMuxFrame(const std::vector<uint8_t>& encryptedData);
